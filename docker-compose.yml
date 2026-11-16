@@ -1,0 +1,33 @@
+services:
+  api:
+    build: .
+    environment:
+      WQ_DB_PATH: /data/wq.db
+      WQ_BUSY_TIMEOUT_MS: "5000"
+      WQ_LOCK_RETRIES: "20"
+    volumes:
+      - wq_data:/data
+    expose:
+      - "8000"
+    deploy:
+      replicas: 2
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  wq_data:
