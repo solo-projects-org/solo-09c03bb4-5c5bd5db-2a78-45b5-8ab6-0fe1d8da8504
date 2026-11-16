@@ -5,6 +5,9 @@ services:
       WQ_DB_PATH: /data/wq.db
       WQ_BUSY_TIMEOUT_MS: "5000"
       WQ_LOCK_RETRIES: "20"
+      WQ_GATEWAY_URL: http://gateway:8100
+      WQ_GATEWAY_TIMEOUT_SEC: "10"
+      WQ_MAX_ROWS_PER_BATCH: "100"
     volumes:
       - wq_data:/data
     expose:
@@ -14,6 +17,23 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    build: .
+    command: ["uvicorn", "gateway.app:app", "--host", "0.0.0.0", "--port", "8100",
+              "--timeout-keep-alive", "0"]
+    environment:
+      GATEWAY_DATA_PATH: /data/gateway_state.json
+    volumes:
+      - gateway_data:/data
+    ports:
+      - "8100:8100"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=2).status==200 else 1)"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -31,3 +51,4 @@ services:
 
 volumes:
   wq_data:
+  gateway_data:

@@ -52,6 +52,47 @@ CREATE TABLE IF NOT EXISTS readings (
 
 CREATE INDEX IF NOT EXISTS idx_readings_station_ts
     ON readings(station_id, ts_utc);
+
+-- 网关批次采集状态：同站同批号只有一条记录，重传/重试都收敛到这一行
+CREATE TABLE IF NOT EXISTS collection_batches (
+    station_id        TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    received_rows     INTEGER NOT NULL CHECK (received_rows >= 0),
+    accepted_rows     INTEGER NOT NULL CHECK (accepted_rows >= 0),
+    quarantined_rows  INTEGER NOT NULL CHECK (quarantined_rows >= 0),
+    state             TEXT NOT NULL CHECK (state IN ('persisted', 'acked')),
+    persisted_at      TEXT NOT NULL,
+    acked_at          TEXT,
+    PRIMARY KEY (station_id, batch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_batches_station_state
+    ON collection_batches(station_id, state);
+CREATE INDEX IF NOT EXISTS idx_batches_persisted
+    ON collection_batches(persisted_at);
+
+-- 隔离明细：原文、来源（站/批/行号）与原因固定保留，不覆盖任何原读数
+CREATE TABLE IF NOT EXISTS quarantine_rows (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_id        TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    line_no           INTEGER NOT NULL,
+    observation_id    TEXT,
+    raw_content       TEXT NOT NULL,
+    reason_code       TEXT NOT NULL,
+    reason_message    TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    FOREIGN KEY (station_id, batch_id)
+        REFERENCES collection_batches(station_id, batch_id),
+    UNIQUE (station_id, batch_id, line_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quarantine_station
+    ON quarantine_rows(station_id);
+CREATE INDEX IF NOT EXISTS idx_quarantine_batch
+    ON quarantine_rows(station_id, batch_id);
+CREATE INDEX IF NOT EXISTS idx_quarantine_reason
+    ON quarantine_rows(reason_code);
 """
 
 

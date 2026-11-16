@@ -1,7 +1,8 @@
-# 水质数仓 · 温度探头观测追溯 API
+# 水质数仓 · 温度探头观测追溯与网关采集 API
 
 一支温度探头发生故障时，数据员需要把它在多座测站留下的**原始观测**全部找出来复核，
-且不能把同站替换探头的数据混进去。本服务提供读数入库、装机时段管理与按探头追溯三类能力。
+且不能把同站替换探头的数据混进去。本服务提供读数入库、装机时段管理、按探头追溯，
+以及按站点网关整批采集积压温度观测四类能力。
 
 ## 业务规则
 
@@ -31,6 +32,47 @@
 - `end` 可省略表示开放上界。
 - **迟到读数**入库后、**追溯换装**提交后，下一次查询立即反映新清单。
 
+### 4. 网关批次采集（清空站点网关积压）
+- `POST /collections/run`，报文 `{"station_id": "ST-A"}`，一次调用按网关采集**一批**：
+  - 每批至多 100 行，批号、行号与原文固定；网关未确认前重复拉取返回同一批（at-least-once）。
+  - 合法行沿用第 1 节读数规则入库；**坏行不卡住正常数据**——
+    同号异文或字段非法的行只进隔离表，保留原文、来源（站/批/行号）与原因，
+    不覆盖任何原读数，同批其他行照常接收。
+  - 整批“接纳 + 隔离 + 批次状态”在**同一个本地事务**内持久化，成功提交后才向网关
+    发确认；本地写入失败整体回滚，绝不提前确认网关。
+  - 返回 `status`：`collected`（新落库一批）、`already_persisted`（重投递去重）、
+    `no_batch`（网关积压已空）。
+- 采集状态与隔离明细查询：
+  - `GET /collections/status?station_id=...`：批次总数、已接纳/隔离行数、
+    `persisted`（已落库待回执）与 `acked`（网关已清退）清单；
+  - `GET /collections/quarantine?station_id=&batch_id=&reason_code=`：隔离明细，
+    可按站/批/原因过滤，每条含原文、行号、原因码与原因说明；
+  - `GET /stations/{station_id}/batches/{batch_id}`：单批接纳/隔离/回执状态。
+- 隔离原因码：`invalid_json`（原文不是合法 JSON 对象）、
+  `invalid_fields`（字段缺失/非法或站号不符）、`reading_conflict`（同号异文）。
+
+#### 采集一致性（不漏行、不重复隔离、不误报完成）
+| 场景 | 行为 |
+| --- | --- |
+| 本地写入失败 | 整批事务回滚，无半批；不向网关确认，批次下次可重新采集 |
+| 网关已清退但回执丢失 | 本地保持 `persisted`，接口返回 502 而非成功；下次采集先对账，网关 410 视为已确认 |
+| 多实例并发采集同一批 | 主键 `(station_id, batch_id)` + 隔离行唯一键去重，恰好落库一次，后到者复用结果 |
+| 采集实例重启后重试 | 启动后首次采集自动对账所有 `persisted` 批次，幂等补确认 |
+| 重复确认旧批号 | 网关校验批号必须是当前队头，否则 410，绝不会误删下一批 |
+| 等待网关响应 | HTTP 调用全部在数据库事务之外，不占 SQLite 锁；其他网关采集与手工录入不受阻塞 |
+
+### 5. 模拟站点网关（Compose 内置）
+网关是独立的 FastAPI 服务（`gateway/app.py`，容器内监听 8100），状态持久化在
+`gateway_data` 卷，重启不丢积压：
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /test/stations/{station_id}/backlog` | 投放一批积压观测（结构化对象或原始 JSON 文本，最多 100 行） |
+| `GET  /stations/{station_id}/batches/next` | 拉队头批次；未确认前重复拉取返回同一批；积压空返回 204 |
+| `POST /stations/{station_id}/batches/{batch_id}/ack` | 确认清退队头；重复确认/批号不符返回 410 |
+| `POST /test/faults` | 注入 `none`/`disconnect`（断线 503）/`ack_lost`（先清退后回执失败 502），可指定 `station_id`、`delay_sec` |
+| `GET  /test/state` / `POST /test/reset` | 观察与复位网关积压/故障 |
+
 ## 一致性与多实例设计
 
 | 关注点 | 实现 |
@@ -47,12 +89,14 @@
 
 ```bash
 docker compose up --build -d
-# api 两副本 + nginx 负载均衡，数据持久化在命名卷 wq_data
+# api 两副本 + nginx 负载均衡，数据持久化在命名卷 wq_data；
+# gateway 单副本承载模拟站点网关，状态在 gateway_data 卷
 ```
 
 - 入口（经 nginx）：<http://localhost:8080>
 - **Swagger 操作入口**：<http://localhost:8080/docs>
 - OpenAPI JSON：<http://localhost:8080/openapi.json>
+- 模拟网关（可直接投放/注入故障）：<http://localhost:8100>，文档 <http://localhost:8100/docs>
 - 健康检查：`GET /health`
 
 单副本直连调试：
@@ -95,6 +139,21 @@ curl -X PUT http://localhost:8080/stations/ST-A/installation \
 
 # 追溯故障探头 P1
 curl 'http://localhost:8080/probes/P1/affected?start=2026-01-01T00:00:00Z&end=2026-03-01T00:00:00Z'
+
+# 向模拟网关投放一批观测（含坏行），再触发采集
+curl -X POST http://localhost:8100/test/stations/ST-A/backlog -H 'Content-Type: application/json' -d '{
+  "batch_id": "B-20260115-01",
+  "rows": [
+    {"observation_id": "GW-1", "station_id": "ST-A", "ts_utc": "2026-01-15T08:00:00Z", "temperature": 21.7},
+    "not-a-json-line",
+    "{\"observation_id\":\"GW-2\",\"station_id\":\"ST-A\",\"ts_utc\":\"bad\",\"temperature\":1}"
+  ]
+}'
+curl -X POST http://localhost:8080/collections/run -H 'Content-Type: application/json' \
+  -d '{"station_id": "ST-A"}'
+# 查询采集状态与隔离明细
+curl 'http://localhost:8080/collections/status?station_id=ST-A'
+curl 'http://localhost:8080/collections/quarantine?station_id=ST-A'
 ```
 
 ## 错误响应格式
@@ -106,18 +165,23 @@ curl 'http://localhost:8080/probes/P1/affected?start=2026-01-01T00:00:00Z&end=20
 | HTTP | code | 含义 |
 | --- | --- | --- |
 | 400 | `invalid_interval` | 时段/查询区间起止非法 |
-| 409 | `reading_conflict` | 同观测号异文补传拒收 |
+| 404 | `batch_not_found` | 查询的采集批次不存在 |
+| 409 | `reading_conflict` | 同观测号异文补传拒收（手工录入）；采集中则转隔离 `reading_conflict` |
 | 409 | `station_overlap` | 同站装机时段重叠，整版拒绝 |
 | 409 | `probe_double_mount` | 探头跨站同时挂载，整版拒绝 |
 | 409 | `version_conflict` | 期望版本与当前版本不一致 |
 | 422 | `validation_error` | 报文/参数结构或类型校验失败 |
+| 502 | `gateway_unavailable` / `ack_lost` / `gateway_pull_failed` 等 | 网关不可达或回执失败，本地批次保留待对账，**不误报完成** |
+| 503 | `database_busy` | 本地写锁竞争超时，无半批写入，可重试 |
+| 504 | `gateway_timeout` | 等待网关响应超时 |
 
 ## 目录结构
 
 ```
-app/            FastAPI 应用（config/db/errors/schemas/service/routers/main）
-tests/          19 项 pytest 场景/并发测试 + 真实 HTTP 端到端冒烟脚本
-Dockerfile      应用镜像（含 healthcheck）
-docker-compose.yml  api×2 + nginx + 持久化卷
-nginx.conf      多副本负载均衡
+app/                数仓 API（config/db/errors/schemas/service/collection/gateway_client/routers/main）
+gateway/app.py      模拟站点网关（投放/拉取/确认 + 断线与回执丢失故障注入）
+tests/              pytest 场景/并发/采集测试 + 真实 HTTP 端到端冒烟脚本
+Dockerfile          应用镜像（API 与网关共用，启动命令不同，含 healthcheck）
+docker-compose.yml  api×2 + nginx + gateway + 持久化卷
+nginx.conf          多副本负载均衡
 ```

@@ -15,6 +15,11 @@ TS_FMT = "%Y-%m-%dT%H:%M:%S.%f%z"
 TS_FAR_FUTURE = "9999-12-31T23:59:59.999999+00:00"
 
 
+def utcnow_text() -> str:
+    """当前 UTC 时刻的定宽文本，与读数时刻的存储格式完全一致。"""
+    return datetime.now(timezone.utc).strftime(TS_FMT)
+
+
 def normalize_ts(value: datetime) -> str:
     if value.tzinfo is None:
         raise ValueError("时刻必须带时区偏移（建议直接使用 UTC，例如 2026-01-01T00:00:00Z）")
@@ -140,3 +145,65 @@ class AffectedResponse(BaseModel):
     install_segments: list[SegmentOut]
     attributed_readings: list[AttributedReadingOut]
     unattributed_readings: list[UnattributedReadingOut]
+
+
+# ============================= 网关采集 =============================
+
+class CollectionRunIn(BaseModel):
+    """触发一次按网关采集（一次调用至多处理一个批次）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    station_id: str = Field(min_length=1, max_length=64)
+
+
+class BatchSummaryOut(BaseModel):
+    station_id: str
+    batch_id: str
+    state: str  # persisted | acked
+    received_rows: int
+    accepted_rows: int
+    quarantined_rows: int
+    persisted_at: str
+    acked_at: str | None = None
+
+
+class CollectionRunOut(BaseModel):
+    station_id: str
+    # no_batch：网关积压已空；collected：本次新落库一批；
+    # already_persisted：批次此前已落库（重试/重复采集），本次仅做回执对账
+    status: str
+    batch: BatchSummaryOut | None = None
+    # 本次采集前对历史“已落库未回执”批次的对账结果
+    reconciled: list[BatchSummaryOut] = []
+
+
+class CollectionStatusOut(BaseModel):
+    station_id: str | None = None
+    total_batches: int
+    persisted_batches: int   # 已落库、等待网关回执
+    acked_batches: int       # 网关已清退
+    total_received: int
+    total_accepted: int
+    total_quarantined: int
+    pending_ack: list[BatchSummaryOut]
+    batches: list[BatchSummaryOut]
+
+
+class QuarantineRowOut(BaseModel):
+    station_id: str
+    batch_id: str
+    line_no: int
+    observation_id: str | None
+    raw_content: str
+    reason_code: str
+    reason_message: str
+    created_at: str
+
+
+class QuarantineListOut(BaseModel):
+    station_id: str | None = None
+    batch_id: str | None = None
+    reason_code: str | None = None
+    total: int
+    items: list[QuarantineRowOut]
